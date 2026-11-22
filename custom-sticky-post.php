@@ -2,235 +2,400 @@
 /**
  * Plugin Name: Custom Sticky Post
  * Description: Закрепление одного поста (только для админов). Совместим с PHP 8.4+ и WordPress 7.0+.
- * Version: 3.4
- * Requires PHP: 8.4
+ * Version:     3.5.0
+ * Author:      Gnostis
+ * Author URI:  https://github.com/Gnoztis
+ * License:     GPL-2.0-or-later
+ * License URI: https://www.gnu.org/licenses/gpl-2.0.html
+ * Text Domain: custom-sticky-post
  * Requires at least: 7.0
+ * Tested up to: 7.1
+ * Requires PHP: 8.4
+ * Update URI:  https://github.com/Gnoztis/custom-sticky-post
+ *
+ * @package CustomStickyPost
  */
 
 if ( ! defined( 'ABSPATH' ) ) {
-    exit;
+	exit;
 }
 
-/**
- * Проверка минимальных версий при активации
+/*
+ * Plugin constants. The version is declared once here and repeated only in the
+ * plugin header above; both must match the release tag.
  */
-register_activation_hook( __FILE__, 'custom_sticky_check_requirements' );
+define( 'CUSTOM_STICKY_VERSION', '3.5.0' );
+define( 'CUSTOM_STICKY_PLUGIN_FILE', __FILE__ );
+define( 'CUSTOM_STICKY_PLUGIN_DIR', plugin_dir_path( __FILE__ ) );
+
+require_once CUSTOM_STICKY_PLUGIN_DIR . 'includes/class-csp-github-updater.php';
+
+/**
+ * Requirements check.
+ *
+ * The activation hook is the wrong place for this: when it runs the plugin is
+ * not in the active_plugins option yet, so deactivate_plugins() does nothing,
+ * and wp_die() leaves a half-activated plugin behind. WordPress validates the
+ * "Requires PHP" / "Requires at least" headers itself on activation, so this
+ * is only a safety net for an environment where that check was bypassed: on
+ * admin_init the plugin deactivates itself and shows a notice instead of
+ * interrupting every request with wp_die().
+ */
+add_action( 'admin_init', 'custom_sticky_check_requirements' );
 function custom_sticky_check_requirements() {
-    if ( version_compare( PHP_VERSION, '8.4', '<' ) ) {
-        deactivate_plugins( plugin_basename( __FILE__ ) );
-        wp_die( 'Плагин требует PHP 8.4 или выше.' );
-    }
-    if ( version_compare( get_bloginfo( 'version' ), '7.0', '<' ) ) {
-        deactivate_plugins( plugin_basename( __FILE__ ) );
-        wp_die( 'Плагин требует WordPress 7.0 или выше.' );
-    }
+	if ( ! current_user_can( 'activate_plugins' ) ) {
+		return;
+	}
+	if ( custom_sticky_requirements_met() ) {
+		return;
+	}
+
+	deactivate_plugins( plugin_basename( __FILE__ ) );
+	add_action( 'admin_notices', 'custom_sticky_requirements_notice' );
 }
 
 /**
- * 1. Метабокс только для администраторов
+ * Whether the site runs a supported PHP and WordPress version.
+ *
+ * @return bool
+ */
+function custom_sticky_requirements_met() {
+	if ( version_compare( PHP_VERSION, '8.4', '<' ) ) {
+		return false;
+	}
+
+	return version_compare( (string) get_bloginfo( 'version' ), '7.0', '>=' );
+}
+
+/**
+ * Notice shown after the plugin deactivated itself.
+ */
+function custom_sticky_requirements_notice() {
+	printf(
+		'<div class="notice notice-error"><p>%s</p></div>',
+		esc_html__( 'Плагин Custom Sticky Post требует PHP 8.4 или выше и WordPress 7.0 или выше.', 'custom-sticky-post' )
+	);
+}
+
+/**
+ * 1. Metabox, administrators only.
  */
 add_action( 'add_meta_boxes', 'custom_sticky_add_meta_box' );
 function custom_sticky_add_meta_box() {
-    if ( ! current_user_can( 'manage_options' ) ) {
-        return;
-    }
-    add_meta_box(
-        'custom_sticky_meta',
-        'Закреплённый пост',
-        'custom_sticky_meta_box_callback',
-        'post',
-        'side',
-        'high'
-    );
-}
+	if ( ! current_user_can( 'manage_options' ) ) {
+		return;
+	}
 
-function custom_sticky_meta_box_callback( $post ) {
-    $sticky_id = get_option( 'custom_sticky_post_id', 0 );
-    $checked   = ( $sticky_id == $post->ID ) ? 'checked' : '';
-    wp_nonce_field( 'custom_sticky_nonce', 'custom_sticky_nonce' );
-    echo '<label>';
-    echo '<input type="checkbox" name="custom_sticky_checkbox" value="1" ' . $checked . ' /> ';
-    echo 'Закрепить этот пост'; // Убран текст "(только один)"
-    echo '</label>';
+	add_meta_box(
+		'custom_sticky_meta',
+		esc_html__( 'Закреплённый пост', 'custom-sticky-post' ),
+		'custom_sticky_meta_box_callback',
+		'post',
+		'side',
+		'high'
+	);
 }
 
 /**
- * 2. Сохранение (только админ) с санитизацией входных данных
+ * Renders the metabox.
+ *
+ * The capability is checked again inside the callback: add_meta_box() already
+ * hides the box from non-admins, but the callback is a public function that a
+ * screen could reach through another registration. The checked attribute is
+ * produced by checked(), so WordPress escapes it instead of it being
+ * concatenated into the markup.
+ *
+ * @param WP_Post $post Post being edited.
+ */
+function custom_sticky_meta_box_callback( $post ) {
+	if ( ! ( $post instanceof WP_Post ) || ! current_user_can( 'manage_options' ) ) {
+		return;
+	}
+
+	$sticky_id = (int) get_option( 'custom_sticky_post_id', 0 );
+
+	wp_nonce_field( 'custom_sticky_nonce', 'custom_sticky_nonce' );
+	?>
+	<label>
+		<input type="checkbox" name="custom_sticky_checkbox" value="1" <?php checked( $sticky_id, (int) $post->ID ); ?> />
+		<?php echo esc_html__( 'Закрепить этот пост', 'custom-sticky-post' ); ?>
+	</label>
+	<?php
+}
+
+/**
+ * 2. Saves the choice (administrators only).
+ *
+ * Order matters: cheap context guards first, then the capability, then the
+ * nonce. A request without the nonce (REST, Quick Edit, autosave, revisions)
+ * never touches the option — the checkbox is not part of those forms. The
+ * nonce is verified before any write, so a forged request cannot move the
+ * sticky post either.
+ *
+ * @param int $post_id Post being saved.
  */
 add_action( 'save_post', 'custom_sticky_save_meta_box' );
 function custom_sticky_save_meta_box( $post_id ) {
-    if ( defined( 'DOING_AUTOSAVE' ) && DOING_AUTOSAVE ) {
-        return;
-    }
+	if ( wp_is_post_revision( $post_id ) || wp_is_post_autosave( $post_id ) ) {
+		return;
+	}
+	if ( defined( 'DOING_AUTOSAVE' ) && DOING_AUTOSAVE ) {
+		return;
+	}
 
-    // Санитизация nonce
-    if ( ! isset( $_POST['custom_sticky_nonce'] ) ) {
-        return;
-    }
-    $nonce = sanitize_text_field( wp_unslash( $_POST['custom_sticky_nonce'] ) );
-    if ( ! wp_verify_nonce( $nonce, 'custom_sticky_nonce' ) ) {
-        return;
-    }
+	$post_id = absint( $post_id );
+	if ( $post_id <= 0 || 'post' !== get_post_type( $post_id ) ) {
+		return;
+	}
 
-    if ( ! current_user_can( 'manage_options' ) || ! current_user_can( 'edit_post', $post_id ) ) {
-        return;
-    }
+	if ( ! current_user_can( 'manage_options' ) || ! current_user_can( 'edit_post', $post_id ) ) {
+		return;
+	}
 
-    // Санитизация checkbox
-    $is_sticky = isset( $_POST['custom_sticky_checkbox'] )
-        ? sanitize_text_field( wp_unslash( $_POST['custom_sticky_checkbox'] ) ) === '1'
-        : false;
+	if ( ! isset( $_POST['custom_sticky_nonce'] ) ) {
+		return;
+	}
+	$nonce = sanitize_text_field( wp_unslash( $_POST['custom_sticky_nonce'] ) );
+	if ( ! wp_verify_nonce( $nonce, 'custom_sticky_nonce' ) ) {
+		return;
+	}
 
-    $current_sticky = get_option( 'custom_sticky_post_id', 0 );
+	$is_sticky = isset( $_POST['custom_sticky_checkbox'] )
+		&& '1' === sanitize_text_field( wp_unslash( $_POST['custom_sticky_checkbox'] ) );
 
-    if ( $is_sticky && $current_sticky != $post_id ) {
-        update_option( 'custom_sticky_post_id', $post_id );
-        custom_sticky_update_post_modified( $post_id );
-        if ( $current_sticky ) {
-            custom_sticky_update_post_modified( $current_sticky );
-        }
-    } elseif ( ! $is_sticky && $current_sticky == $post_id ) {
-        delete_option( 'custom_sticky_post_id' );
-        custom_sticky_update_post_modified( $post_id );
-    }
+	$current_sticky = (int) get_option( 'custom_sticky_post_id', 0 );
+
+	if ( $is_sticky && $current_sticky !== $post_id ) {
+		update_option( 'custom_sticky_post_id', $post_id );
+		custom_sticky_update_post_modified( $post_id );
+		if ( $current_sticky > 0 ) {
+			custom_sticky_update_post_modified( $current_sticky );
+		}
+	} elseif ( ! $is_sticky && $current_sticky === $post_id ) {
+		delete_option( 'custom_sticky_post_id' );
+		custom_sticky_update_post_modified( $post_id );
+	}
 }
 
 /**
- * Вспомогательная функция: обновляет post_modified и post_modified_gmt
- * Использует current_datetime() — современный API WordPress
+ * Bumps post_modified and post_modified_gmt of a post.
+ *
+ * Written straight to $wpdb->posts on purpose: wp_update_post() would fire
+ * save_post again, re-enter the handler above and run revisions and content
+ * filters for what is only a modification date. The ID is cast, both values
+ * are formatted here and bound with explicit types, and the post cache is
+ * invalidated afterwards so the change is visible to the rest of the request.
+ *
+ * @param int $post_id Post ID.
  */
 function custom_sticky_update_post_modified( $post_id ) {
-    global $wpdb;
-    $now = current_datetime();
-    $wpdb->update(
-        $wpdb->posts,
-        array(
-            'post_modified'     => $now->format( 'Y-m-d H:i:s' ),
-            'post_modified_gmt' => $now->setTimezone( new DateTimeZone( 'UTC' ) )->format( 'Y-m-d H:i:s' ),
-        ),
-        array( 'ID' => $post_id ),
-        array( '%s', '%s' ),
-        array( '%d' )
-    );
-    clean_post_cache( $post_id );
+	$post_id = absint( $post_id );
+	if ( $post_id <= 0 || wp_is_post_revision( $post_id ) || wp_is_post_autosave( $post_id ) ) {
+		return;
+	}
+	if ( ! ( get_post( $post_id ) instanceof WP_Post ) ) {
+		return;
+	}
+
+	global $wpdb;
+
+	$now = current_datetime();
+	$utc = $now->setTimezone( new DateTimeZone( 'UTC' ) );
+
+	$wpdb->update(
+		$wpdb->posts,
+		array(
+			'post_modified'     => $now->format( 'Y-m-d H:i:s' ),
+			'post_modified_gmt' => $utc->format( 'Y-m-d H:i:s' ),
+		),
+		array( 'ID' => $post_id ),
+		array( '%s', '%s' ),
+		array( '%d' )
+	);
+
+	clean_post_cache( $post_id );
 }
 
 /**
- * 3. Обновляем post_modified при публикации любого поста
+ * 3. Bumps the modification date on publish and drops the option when the
+ * sticky post stops being published.
+ *
+ * Without the cleanup on unpublish the option keeps pointing at a draft or a
+ * trashed post until some front-end request notices it, so the home page can
+ * briefly render a stale reference.
+ *
+ * @param string  $new_status New status.
+ * @param string  $old_status Previous status.
+ * @param WP_Post $post       Post object.
  */
 add_action( 'transition_post_status', 'custom_sticky_transition_post_status', 10, 3 );
 function custom_sticky_transition_post_status( $new_status, $old_status, $post ) {
-    if ( 'publish' === $new_status && 'publish' !== $old_status ) {
-        custom_sticky_update_post_modified( $post->ID );
-    }
+	if ( ! ( $post instanceof WP_Post ) || wp_is_post_revision( $post->ID ) || wp_is_post_autosave( $post->ID ) ) {
+		return;
+	}
+
+	$sticky_id = (int) get_option( 'custom_sticky_post_id', 0 );
+
+	if ( 'publish' === $new_status && 'publish' !== $old_status ) {
+		custom_sticky_update_post_modified( $post->ID );
+	}
+
+	if ( 'publish' !== $new_status && $sticky_id > 0 && $sticky_id === (int) $post->ID ) {
+		delete_option( 'custom_sticky_post_id' );
+	}
 }
 
 /**
- * 4. Очистка опции при удалении поста
+ * 4. Drops the option when the sticky post is deleted for good.
+ *
+ * @param int $post_id Deleted post ID.
  */
 add_action( 'delete_post', 'custom_sticky_delete_post' );
 function custom_sticky_delete_post( $post_id ) {
-    $sticky_id = get_option( 'custom_sticky_post_id', 0 );
-    if ( $sticky_id == $post_id ) {
-        delete_option( 'custom_sticky_post_id' );
-    }
+	$sticky_id = (int) get_option( 'custom_sticky_post_id', 0 );
+
+	if ( $sticky_id > 0 && $sticky_id === (int) $post_id ) {
+		delete_option( 'custom_sticky_post_id' );
+	}
 }
 
 /**
- * 5. Скрываем миниатюру только на главной
+ * 5. Hides the thumbnail of the sticky post on the blog home page only.
+ *
+ * @param string $html             Thumbnail markup.
+ * @param int    $post_id          Post ID.
+ * @param int    $post_thumbnail_id Attachment ID.
+ * @return string
  */
 add_filter( 'post_thumbnail_html', 'custom_sticky_hide_thumbnail_on_home', 10, 3 );
 function custom_sticky_hide_thumbnail_on_home( $html, $post_id, $post_thumbnail_id ) {
-    if ( is_home() ) {
-        $sticky_id = get_option( 'custom_sticky_post_id', 0 );
-        if ( $sticky_id == $post_id ) {
-            return '';
-        }
-    }
-    return $html;
+	if ( ! is_home() ) {
+		return $html;
+	}
+
+	$sticky_id = (int) get_option( 'custom_sticky_post_id', 0 );
+
+	if ( $sticky_id > 0 && $sticky_id === (int) $post_id ) {
+		return '';
+	}
+
+	return $html;
 }
 
 /**
- * 6. Вывод закреплённого поста отдельным запросом
+ * 6. Moves the sticky post to the top of the blog home loop.
+ *
+ * Only the first page is reordered. loop_start runs on every page of the
+ * archive, and prepending on page 2 would show the same post twice; the total
+ * count (found_posts) is intentionally not touched, so the pagination links
+ * stay correct.
+ *
+ * The post is removed from the current results before it is prepended, so a
+ * second loop_start on the same query (rewind_posts) does not duplicate it.
+ *
+ * @param WP_Query $query Query whose loop is starting.
  */
 add_action( 'loop_start', 'custom_sticky_override_loop_start' );
 function custom_sticky_override_loop_start( $query ) {
-    if ( ! is_home() || ! $query->is_main_query() ) {
-        return;
-    }
+	if ( ! ( $query instanceof WP_Query ) || ! is_home() || ! $query->is_main_query() ) {
+		return;
+	}
+	if ( is_paged() || ! is_array( $query->posts ) ) {
+		return;
+	}
 
-    $sticky_id = get_option( 'custom_sticky_post_id', 0 );
-    if ( ! $sticky_id ) {
-        return;
-    }
+	$sticky_id = (int) get_option( 'custom_sticky_post_id', 0 );
+	if ( $sticky_id <= 0 ) {
+		return;
+	}
 
-    $sticky_post = get_post( $sticky_id );
-    if ( ! $sticky_post || $sticky_post->post_status != 'publish' ) {
-        delete_option( 'custom_sticky_post_id' );
-        return;
-    }
+	$sticky_post = get_post( $sticky_id );
+	if ( ! ( $sticky_post instanceof WP_Post ) || 'publish' !== $sticky_post->post_status ) {
+		delete_option( 'custom_sticky_post_id' );
+		return;
+	}
 
-    $original_posts = $query->posts;
-    $filtered_posts = array_filter( $original_posts, function( $post ) use ( $sticky_id ) {
-        return $post->ID != $sticky_id;
-    } );
+	$remaining = array_values(
+		array_filter(
+			$query->posts,
+			static function ( $post ) use ( $sticky_id ) {
+				return $post instanceof WP_Post && (int) $post->ID !== $sticky_id;
+			}
+		)
+	);
 
-    $new_posts = array_merge( array( $sticky_post ), $filtered_posts );
-    $query->posts = $new_posts;
-    $query->post_count = count( $new_posts );
+	$query->posts      = array_merge( array( $sticky_post ), $remaining );
+	$query->post_count = count( $query->posts );
 }
 
 /**
- * 7. Добавляем класс custom-sticky-post
+ * 7. Adds the custom-sticky-post class to the sticky post.
+ *
+ * @param string[] $classes Post classes.
+ * @param string[] $class   Additional classes.
+ * @param int      $post_id Post ID.
+ * @return string[]
  */
 add_filter( 'post_class', 'custom_sticky_post_class', 999, 3 );
 function custom_sticky_post_class( $classes, $class, $post_id ) {
-    $sticky_id = get_option( 'custom_sticky_post_id', 0 );
-    if ( $sticky_id == $post_id ) {
-        if ( ! in_array( 'custom-sticky-post', $classes, true ) ) {
-            $classes[] = 'custom-sticky-post';
-        }
-    }
-    return $classes;
+	$sticky_id = (int) get_option( 'custom_sticky_post_id', 0 );
+
+	if ( $sticky_id > 0 && $sticky_id === (int) $post_id && is_array( $classes )
+		&& ! in_array( 'custom-sticky-post', $classes, true ) ) {
+		$classes[] = 'custom-sticky-post';
+	}
+
+	return $classes;
 }
 
 /**
- * 8. Стили с максимальным приоритетом
+ * 8. Prints the sticky post styles on the home page.
+ *
+ * The stylesheet is static: no option, post field or request value is
+ * interpolated, so there is nothing to escape here. The marker classes are
+ * unchanged from the released version.
  */
 add_action( 'wp_head', 'custom_sticky_styles', 9999 );
 function custom_sticky_styles() {
-    if ( ! is_home() ) {
-        return;
-    }
-    $sticky_id = get_option( 'custom_sticky_post_id', 0 );
-    if ( ! $sticky_id ) {
-        return;
-    }
-    ?>
-    <style>
-        body.home #primary .post-cards .custom-sticky-post,
-        body.home .post-cards .custom-sticky-post {
-            background-color: #1a1a1a !important;
-            border-left: 6px solid #d9534f !important;
-            padding: 15px 20px !important;
-            margin-bottom: 25px !important;
-            border-radius: 4px !important;
-            color: #eee !important;
-            overflow: hidden !important;
-            word-wrap: break-word !important;
-            box-sizing: border-box !important;
-            box-shadow: 0 2px 8px rgba(0,0,0,0.4) !important;
-        }
-        body.home .custom-sticky-post .post-card__title a,
-        body.home .custom-sticky-post .post-card__title {
-            color: inherit !important;
-        }
-        body.home .custom-sticky-post .post-card__content {
-            color: #ccc !important;
-        }
-        body.home .custom-sticky-post .post-meta {
-            color: #999 !important;
-        }
-    </style>
-    <?php
+	if ( ! is_home() ) {
+		return;
+	}
+
+	$sticky_id = (int) get_option( 'custom_sticky_post_id', 0 );
+	if ( $sticky_id <= 0 ) {
+		return;
+	}
+	?>
+	<style>
+		body.home #primary .post-cards .custom-sticky-post,
+		body.home .post-cards .custom-sticky-post {
+			background-color: #1a1a1a !important;
+			border-left: 6px solid #d9534f !important;
+			padding: 15px 20px !important;
+			margin-bottom: 25px !important;
+			border-radius: 4px !important;
+			color: #eee !important;
+			overflow: hidden !important;
+			word-wrap: break-word !important;
+			box-sizing: border-box !important;
+			box-shadow: 0 2px 8px rgba(0,0,0,0.4) !important;
+		}
+		body.home .custom-sticky-post .post-card__title a,
+		body.home .custom-sticky-post .post-card__title {
+			color: inherit !important;
+		}
+		body.home .custom-sticky-post .post-card__content {
+			color: #ccc !important;
+		}
+		body.home .custom-sticky-post .post-meta {
+			color: #999 !important;
+		}
+	</style>
+	<?php
 }
+
+/*
+ * Updates arrive through the native WordPress mechanism: the updater only
+ * feeds the update_plugins transient from GitHub Releases and tags.
+ */
+( new CSP_GitHub_Updater() )->register_hooks();

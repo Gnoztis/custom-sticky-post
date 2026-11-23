@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Custom Sticky Post
  * Description: Закрепление одного поста (только для админов). Совместим с PHP 8.4+ и WordPress 7.0+.
- * Version:     3.5.8
+ * Version:     3.5.9
  * Author:      Gnostis
  * Author URI:  https://github.com/Gnoztis
  * License:     GPL-2.0-or-later
@@ -24,7 +24,7 @@ if ( ! defined( 'ABSPATH' ) ) {
  * Plugin constants. The version is declared once here and repeated only in the
  * plugin header above; both must match the release tag.
  */
-define( 'CUSTOM_STICKY_VERSION', '3.5.8' );
+define( 'CUSTOM_STICKY_VERSION', '3.5.9' );
 define( 'CUSTOM_STICKY_PLUGIN_FILE', __FILE__ );
 define( 'CUSTOM_STICKY_PLUGIN_DIR', plugin_dir_path( __FILE__ ) );
 
@@ -220,6 +220,12 @@ function custom_sticky_update_post_modified( $post_id ) {
  * 3. Bumps the modification date on publish and drops the option when the
  * sticky post stops being published.
  *
+ * The home page's Last-Modified and therefore the reverse-proxy cache follow
+ * the first post in the loop — the sticky post. Publishing another post must
+ * therefore move the sticky post's modification date as well, otherwise nginx
+ * keeps answering "not modified" and serves the old page. The saved post is
+ * bumped as before; the sticky post is bumped separately, never itself twice.
+ *
  * Without the cleanup on unpublish the option keeps pointing at a draft or a
  * trashed post until some front-end request notices it, so the home page can
  * briefly render a stale reference.
@@ -230,6 +236,9 @@ function custom_sticky_update_post_modified( $post_id ) {
  */
 add_action( 'transition_post_status', 'custom_sticky_transition_post_status', 10, 3 );
 function custom_sticky_transition_post_status( $new_status, $old_status, $post ) {
+	if ( defined( 'DOING_AUTOSAVE' ) && DOING_AUTOSAVE ) {
+		return;
+	}
 	if ( ! ( $post instanceof WP_Post ) || wp_is_post_revision( $post->ID ) || wp_is_post_autosave( $post->ID ) ) {
 		return;
 	}
@@ -238,11 +247,56 @@ function custom_sticky_transition_post_status( $new_status, $old_status, $post )
 
 	if ( 'publish' === $new_status && 'publish' !== $old_status ) {
 		custom_sticky_update_post_modified( $post->ID );
+
+		if ( 'post' === $post->post_type && $sticky_id > 0 && $sticky_id !== (int) $post->ID ) {
+			custom_sticky_update_post_modified( $sticky_id );
+		}
 	}
 
 	if ( 'publish' !== $new_status && $sticky_id > 0 && $sticky_id === (int) $post->ID ) {
 		delete_option( 'custom_sticky_post_id' );
 	}
+}
+
+/**
+ * 3b. Bumps the sticky post when an already published post is saved.
+ *
+ * Editing a published post does not change its status, so the
+ * transition_post_status handler above does not run a publish pass for it. The
+ * home page still renders the sticky post first, and its modification date is
+ * what the theme and the reverse proxy use for Last-Modified — so it has to
+ * move on every save of any other post. The sticky post itself is skipped: its
+ * own save already updates post_modified through WordPress, and bumping it here
+ * as well would run the update twice.
+ *
+ * @param int     $post_id     Saved post ID.
+ * @param WP_Post $post_after  Post after the save.
+ * @param WP_Post $post_before Post before the save.
+ */
+add_action( 'post_updated', 'custom_sticky_bump_sticky_on_published_update', 10, 3 );
+function custom_sticky_bump_sticky_on_published_update( $post_id, $post_after, $post_before ) {
+	if ( defined( 'DOING_AUTOSAVE' ) && DOING_AUTOSAVE ) {
+		return;
+	}
+	if ( wp_is_post_revision( $post_id ) || wp_is_post_autosave( $post_id ) ) {
+		return;
+	}
+	if ( ! ( $post_after instanceof WP_Post ) || ! ( $post_before instanceof WP_Post ) ) {
+		return;
+	}
+	if ( 'publish' !== $post_after->post_status || 'publish' !== $post_before->post_status ) {
+		return;
+	}
+	if ( 'post' !== $post_after->post_type ) {
+		return;
+	}
+
+	$sticky_id = (int) get_option( 'custom_sticky_post_id', 0 );
+	if ( $sticky_id <= 0 || $sticky_id === (int) $post_after->ID ) {
+		return;
+	}
+
+	custom_sticky_update_post_modified( $sticky_id );
 }
 
 /**

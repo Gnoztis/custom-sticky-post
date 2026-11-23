@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Custom Sticky Post
  * Description: Закрепление одного поста (только для админов). Совместим с PHP 8.4+ и WordPress 7.0+.
- * Version:     3.5.6
+ * Version:     3.5.7
  * Author:      Gnostis
  * Author URI:  https://github.com/Gnoztis
  * License:     GPL-2.0-or-later
@@ -24,7 +24,7 @@ if ( ! defined( 'ABSPATH' ) ) {
  * Plugin constants. The version is declared once here and repeated only in the
  * plugin header above; both must match the release tag.
  */
-define( 'CUSTOM_STICKY_VERSION', '3.5.6' );
+define( 'CUSTOM_STICKY_VERSION', '3.5.7' );
 define( 'CUSTOM_STICKY_PLUGIN_FILE', __FILE__ );
 define( 'CUSTOM_STICKY_PLUGIN_DIR', plugin_dir_path( __FILE__ ) );
 
@@ -376,7 +376,130 @@ function custom_sticky_prepend_sticky_post( $posts, $query ) {
 }
 
 /**
- * 8. Adds the custom-sticky-post class to the sticky post.
+ * 8. Last-Modified of the page that is actually rendered.
+ *
+ * The sticky post is prepended to $query->posts, so anything that takes the
+ * modification time of the first post — a theme, a page cache, a reverse proxy
+ * comparing If-Modified-Since — keeps reporting the sticky post's time and
+ * never notices a new post. This plugin therefore sets Last-Modified itself,
+ * from every post that renders: the query results (the sticky post is already
+ * among them on the home page) plus the posts excluded through post__not_in.
+ * The sticky post is exactly such an excluded post; including the excluded IDs
+ * also covers a filter that hides a post from the SQL query while the site
+ * still shows it, so a newly published post cannot leave the header behind.
+ *
+ * Read-only: nothing is written to the database.
+ *
+ * @return int Unix timestamp in UTC, 0 when the request has no posts.
+ */
+function custom_sticky_last_modified_timestamp() {
+	global $wp_query;
+
+	$query = $wp_query;
+	if ( ! ( $query instanceof WP_Query ) || ! $query->is_main_query() ) {
+		return 0;
+	}
+	if ( is_admin() || ! ( $query->is_home() || $query->is_archive() || $query->is_feed() ) ) {
+		return 0;
+	}
+
+	$posts = array();
+	if ( is_array( $query->posts ) ) {
+		foreach ( $query->posts as $post ) {
+			if ( $post instanceof WP_Post ) {
+				$posts[ (int) $post->ID ] = $post;
+			}
+		}
+	}
+
+	$excluded = $query->get( 'post__not_in' );
+	if ( is_array( $excluded ) && $excluded ) {
+		$excluded_ids = array_values( array_unique( array_filter( array_map( 'absint', $excluded ) ) ) );
+
+		if ( $excluded_ids ) {
+			// One query for the whole list instead of one get_post() per ID.
+			if ( function_exists( '_prime_post_caches' ) ) {
+				_prime_post_caches( $excluded_ids, false, false );
+			}
+
+			$post_types = $query->get( 'post_type' );
+			$post_types = empty( $post_types ) ? array( 'post' ) : array_map( 'strval', (array) $post_types );
+			$any_type   = in_array( 'any', $post_types, true );
+
+			foreach ( $excluded_ids as $excluded_id ) {
+				if ( isset( $posts[ $excluded_id ] ) ) {
+					continue;
+				}
+
+				$excluded_post = get_post( $excluded_id );
+				if ( ! ( $excluded_post instanceof WP_Post ) || 'publish' !== $excluded_post->post_status ) {
+					continue;
+				}
+				if ( ! $any_type && ! in_array( $excluded_post->post_type, $post_types, true ) ) {
+					continue;
+				}
+
+				$posts[ $excluded_id ] = $excluded_post;
+			}
+		}
+	}
+
+	$latest = 0;
+	foreach ( $posts as $post ) {
+		$modified_gmt = (string) $post->post_modified_gmt;
+		if ( '' === $modified_gmt || '0000-00-00 00:00:00' === $modified_gmt ) {
+			continue;
+		}
+
+		$timestamp = strtotime( $modified_gmt . ' UTC' );
+		if ( false !== $timestamp && $timestamp > $latest ) {
+			$latest = $timestamp;
+		}
+	}
+
+	return $latest;
+}
+
+/**
+ * Sends the Last-Modified header, never lowering a newer value already sent.
+ *
+ * Hooked on send_headers at a late priority and again late on
+ * template_redirect: a theme that computes the value from the first post does
+ * it in its own template_redirect callback, which runs after send_headers. The
+ * second pass replaces that older value; a newer value set by the theme is
+ * kept, so the header only ever moves forward.
+ */
+function custom_sticky_maybe_send_last_modified() {
+	if ( headers_sent() ) {
+		return;
+	}
+
+	$latest = custom_sticky_last_modified_timestamp();
+	if ( $latest <= 0 ) {
+		return;
+	}
+
+	foreach ( headers_list() as $header ) {
+		if ( 0 !== stripos( $header, 'Last-Modified:' ) ) {
+			continue;
+		}
+
+		$existing = trim( substr( $header, strlen( 'Last-Modified:' ) ) );
+		$existing_timestamp = strtotime( $existing );
+		if ( false !== $existing_timestamp && $existing_timestamp >= $latest ) {
+			return;
+		}
+	}
+
+	// The value is a formatted UTC timestamp, never request input.
+	header( 'Last-Modified: ' . gmdate( 'D, d M Y H:i:s', $latest ) . ' GMT', true ); // phpcs:ignore -- formatted timestamp, not user input.
+}
+
+add_action( 'send_headers', 'custom_sticky_maybe_send_last_modified', 9999 );
+add_action( 'template_redirect', 'custom_sticky_maybe_send_last_modified', 9999 );
+
+/**
+ * 9. Adds the custom-sticky-post class to the sticky post.
  *
  * @param string[] $classes Post classes.
  * @param string[] $class   Additional classes.
@@ -396,7 +519,7 @@ function custom_sticky_post_class( $classes, $class, $post_id ) {
 }
 
 /**
- * 9. Prints the sticky post styles on the home page.
+ * 10. Prints the sticky post styles on the home page.
  *
  * The stylesheet is static: no option, post field or request value is
  * interpolated, so there is nothing to escape here. The marker classes are

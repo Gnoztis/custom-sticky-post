@@ -2,106 +2,142 @@
 /**
  * GitHub updater for Custom Sticky Post.
  *
- * @package CustomStickyPost
+ * GENERATED FILE — do not edit by hand.
+ * Source: tools/shared/updater/class-github-updater.php
+ * Regenerate: node tools/scripts/sync-updater.mjs custom-sticky-post
  */
-
 if ( ! defined( 'ABSPATH' ) ) {
 	exit;
 }
 
 /**
- * Plugin updates through the native WordPress mechanism, sourced from the
- * GitHub releases and tags of Gnoztis/custom-sticky-post.
+ * Plugin updates through the native WordPress mechanism; source — GitHub
+ * Releases and tags of the repository constant.
  *
- * The source of truth is the highest version found in the latest GitHub
- * release and in the tag list, whichever is newer: a tag can be published
- * without a matching release, and then the release alone would never offer an
- * update. WordPress sees the new version, shows it under Plugins and updates
- * from the package of the winning source. No third-party libraries and no
- * write requests to the repository.
- *
- * The key of the update_plugins entry is the runtime plugin_basename() of the
- * installed main file, never a constant: the plugin folder can be renamed by
- * a manual upload or by a GitHub zipball, and WordPress lists only entries
- * whose key matches an installed plugin file.
+ * The source of truth is the highest version of the GitHub Release and the
+ * newest vX.Y.Z tag: WordPress sees the new version, shows it under Plugins
+ * and updates from the package of the winning source.
+ * No third-party libraries and no write requests to the repository.
  */
 final class CSP_GitHub_Updater {
 
-	/** Repository that hosts the published versions. */
-	private const REPO = 'Gnoztis/custom-sticky-post';
+	private const TRANSIENT       = 'csp_github_release';
+	private const ERROR_TRANSIENT = 'csp_github_release_error';
 
-	/** Plugin slug: archive naming only, never the update_plugins key. */
-	private const SLUG = 'custom-sticky-post';
-
-	/** Successful GitHub answer is cached for six hours. */
-	private const CACHE_TTL = 21600;
-
-	/** A completely failed check is retried after fifteen minutes. */
-	private const ERROR_TTL = 900;
-
-	private const UPDATE_TRANSIENT = 'csp_github_release';
-
-	private const UPDATE_ERROR_TRANSIENT = 'csp_github_release_error';
-
-	/** @var array{requires:string,requires_php:string,tested:string}|null */
 	private static ?array $header = null;
 
 	/**
-	 * Hooks the updater into the WordPress update pipeline.
+	 * Explicit user action, not a scheduled check: must not be answered from
+	 * the error backoff, which otherwise hides the fact that no request was
+	 * made at all.
 	 */
+	private static bool $force = false;
+
+	/**
+	 * Failure of the request in flight: ['code' => int, 'reason' => string,
+	 * 'at' => int]. The reason vocabulary lives in error_reason().
+	 *
+	 * @var array{code:int,reason:string,at:int}|null
+	 */
+	private ?array $last_error = null;
+
 	public function register_hooks(): void {
-		add_filter( 'pre_set_site_transient_update_plugins', array( $this, 'inject_update' ) );
-		add_filter( 'plugins_api', array( $this, 'plugin_info' ), 10, 3 );
-		add_filter( 'upgrader_source_selection', array( $this, 'rename_source' ), 10, 4 );
-		add_action( 'upgrader_process_complete', array( $this, 'after_upgrade' ), 10, 2 );
-		add_action( 'load-plugins.php', array( $this, 'maybe_force_check' ) );
-		add_filter( 'plugin_action_links_' . self::basename(), array( $this, 'action_links' ) );
+		add_filter( 'pre_set_site_transient_update_plugins', [ $this, 'inject_update' ] );
+		add_filter( 'plugins_api',                           [ $this, 'plugin_info' ], 10, 3 );
+		add_filter( 'upgrader_source_selection',             [ $this, 'rename_source' ], 10, 4 );
+		add_action( 'upgrader_process_complete',             [ $this, 'after_upgrade' ], 10, 2 );
+		add_action( 'load-plugins.php',                      [ $this, 'maybe_force_check' ] );
+		add_action( 'admin_notices',                         [ $this, 'admin_notices' ] );
+		add_filter( 'plugin_action_links_' . self::basename(), [ $this, 'action_links' ] );
+		add_filter( 'http_request_args', [ $this, 'authenticate_download' ], 10, 2 );
 	}
 
-	/* ============================================================
-	 *  Installed location
-	 * ============================================================ */
+	/**
+	 * Attaches the token to the package download of a private repository.
+	 *
+	 * WordPress downloads the archive itself, outside api_get(), so without this
+	 * filter a private repository answers 404 even when the token is valid.
+	 * Only GitHub download hosts are touched: api.github.com (release assets),
+	 * codeload.github.com (zipball) and the signed asset host. A generic
+	 * github.com URL is deliberately left alone, so the token can never be sent
+	 * to another plugin's download.
+	 *
+	 * @param array<string,mixed> $args Request arguments.
+	 * @param string              $url  Request URL.
+	 * @return array<string,mixed>
+	 */
+	public function authenticate_download( $args, $url ) {
+		$token = self::token();
+
+		if ( '' === $token || ! is_string( $url ) || ! is_array( $args ) ) {
+			return $args;
+		}
+
+		if ( 'https' !== strtolower( (string) wp_parse_url( $url, PHP_URL_SCHEME ) ) ) {
+			return $args;
+		}
+
+		$host = strtolower( (string) wp_parse_url( $url, PHP_URL_HOST ) );
+		$path = (string) wp_parse_url( $url, PHP_URL_PATH );
+
+		if ( 'github.com' === $host ) {
+			// A release asset is downloaded from github.com/<owner>/<repo>/
+			// releases/download/...; authorise it only for our own repository, so
+			// the token cannot travel to another plugin's download.
+			$ours = '/' . strtolower( 'custom-sticky-post' ) . '/';
+
+			if ( false === strpos( strtolower( $path ), '/releases/download/' ) || false === strpos( strtolower( $path ), $ours ) ) {
+				return $args;
+			}
+		} elseif ( ! in_array( $host, [ 'api.github.com', 'codeload.github.com', 'objects.githubusercontent.com' ], true ) ) {
+			return $args;
+		}
+
+		$args['headers'] = is_array( $args['headers'] ?? null ) ? $args['headers'] : [];
+		$args['headers']['Authorization'] = 'Bearer ' . $token;
+
+		return $args;
+	}
 
 	/**
 	 * Basename of the installed main plugin file, e.g.
 	 * "custom-sticky-post/custom-sticky-post.php".
 	 *
-	 * Computed at runtime, never taken from a constant: the folder is whatever
-	 * the site has. WordPress keys update_plugins->response by this basename
-	 * and counts every entry for the admin badge, but lists only entries whose
-	 * key matches a file from get_plugins() — so a hard-coded key shows an
+	 * Computed at runtime, never taken from a constant: the folder is
+	 * whatever the site has. A GitHub zipball unpacks into
+	 * Gnoztis-custom-sticky-post-<sha>, a manual upload can use any name.
+	 * WordPress keys update_plugins->response by this basename and counts
+	 * every entry for the admin badge, but lists only entries whose key
+	 * matches a file from get_plugins() — so a hard-coded key shows an
 	 * "update available" badge with an empty update list.
 	 */
 	public static function basename(): string {
 		$basename = plugin_basename( CUSTOM_STICKY_PLUGIN_FILE );
 
-		if ( '' === $basename ) {
-			// An empty result means the main file is not inside the plugin
-			// directory; fall back to the documented layout.
-			$basename = self::SLUG . '/' . wp_basename( CUSTOM_STICKY_PLUGIN_FILE );
+		if ( $basename === '' ) {
+			// plugin_basename() returns the path relative to the plugin
+			// directory; an empty result means the main file was not inside
+			// it, so fall back to the documented layout.
+			$basename = 'custom-sticky-post' . '/' . wp_basename( CUSTOM_STICKY_PLUGIN_FILE );
 		}
 
 		return $basename;
 	}
 
-	/**
-	 * Folder name of the installed plugin, used for the "slug" field and for
-	 * matching the plugin information request. Falls back to SLUG when the
-	 * main file sits directly in the plugins directory.
-	 */
-	private static function dirname(): string {
-		$folder = dirname( self::basename() );
-
-		return ( '.' === $folder || '' === $folder ) ? self::SLUG : $folder;
-	}
-
 	/* ============================================================
-	 *  Update plumbing
+	 *  Updates
 	 * ============================================================ */
 
 	/**
-	 * Adds our entry to the update_plugins transient when GitHub has a newer
-	 * version than the installed one.
+	 * Adds our entry to the update_plugins transient when GitHub has a
+	 * release newer than the installed version.
+	 *
+	 * The comparison is made against both the version constant and the
+	 * header of the file on disk: inside the request that replaces the
+	 * files, core re-writes this transient while the constant still holds
+	 * the version loaded at the start of the request. Comparing only with
+	 * the constant would re-inject "2.5.0 -> 2.5.0" right after a
+	 * successful update, and the phantom entry would live up to 12 hours.
 	 *
 	 * @param mixed $transient
 	 * @return mixed
@@ -111,49 +147,47 @@ final class CSP_GitHub_Updater {
 			return $transient;
 		}
 		if ( ! isset( $transient->response ) || ! is_array( $transient->response ) ) {
-			$transient->response = array();
+			$transient->response = [];
 		}
 
 		$basename  = self::basename();
 		$installed = $this->installed_version();
 
-		// Runs before the early returns: a dangling entry is a leftover of the
-		// previous key and must disappear even when GitHub is unreachable now.
+		// Runs before the early returns: a dangling entry is a leftover of
+		// the previous key and must disappear even when GitHub is
+		// unreachable right now.
 		$this->purge_stale_entries( $transient, $basename );
 
-		// The entry offers what is already on disk: drop it, so a phantom left
-		// by the request that installed the update disappears on this run.
+		// The entry offers what is already on disk: drop it, so a phantom
+		// left by an earlier run disappears on this one.
 		$this->purge_installed_entry( $transient, $basename, $installed );
 
 		$release = $this->get_release();
-		if ( null === $release ) {
+		if ( $release === null ) {
 			return $transient;
 		}
 
-		// Inside the request that replaces the files the constant still holds
-		// the version loaded at request start, so the release must be newer
-		// than both the constant and the header on disk.
-		if ( ! version_compare( $release['version'], CUSTOM_STICKY_VERSION, '>' ) ) {
-			return $transient;
-		}
-		if ( ! version_compare( $release['version'], $installed, '>' ) ) {
+		// Newer than the running code (constant) and than the files on
+		// disk (header), otherwise there is nothing to install.
+		if ( version_compare( $release['version'], CUSTOM_STICKY_VERSION, '<=' )
+			|| version_compare( $release['version'], $installed, '<=' ) ) {
 			return $transient;
 		}
 
-		$transient->response[ $basename ] = (object) array(
+		$transient->response[ $basename ] = (object) [
 			'id'            => $basename,
-			'slug'          => self::dirname(),
+			'slug'          => 'custom-sticky-post',
 			'plugin'        => $basename,
 			'new_version'   => $release['version'],
-			'url'           => 'https://github.com/' . self::REPO,
+			'url'           => 'https://github.com/' . 'Gnoztis/custom-sticky-post',
 			'package'       => $release['package'],
 			'tested'        => $release['tested'],
 			'requires'      => $release['requires'],
 			'requires_php'  => $release['requires_php'],
-			'icons'         => array(),
-			'banners'       => array(),
+			'icons'         => [],
+			'banners'       => [],
 			'compatibility' => new stdClass(),
-		);
+		];
 
 		if ( isset( $transient->no_update ) && is_array( $transient->no_update ) ) {
 			unset( $transient->no_update[ $basename ] );
@@ -163,12 +197,61 @@ final class CSP_GitHub_Updater {
 	}
 
 	/**
+	 * Version of the main plugin file as it is on disk.
+	 *
+	 * Deliberately not cached in a static: the whole point is to see the
+	 * files after Plugin_Upgrader replaced them within the current request.
+	 * get_file_data() reads the first 8 KB of one file, so the cost is
+	 * negligible next to the transient write it guards.
+	 */
+	private function installed_version(): string {
+		$data = function_exists( 'get_file_data' )
+			? get_file_data( CUSTOM_STICKY_PLUGIN_FILE, [ 'Version' => 'Version' ], 'plugin' )
+			: [];
+
+		$version = isset( $data['Version'] ) ? trim( (string) $data['Version'] ) : '';
+
+		return $version !== '' ? $version : CUSTOM_STICKY_VERSION;
+	}
+
+	/**
+	 * Removes our own update entry when it offers what is already installed.
+	 *
+	 * Core compares the entry's new_version with the version from
+	 * get_plugins() and shows the row as an update anyway until the
+	 * transient is rebuilt, so the entry must not stay in response.
+	 *
+	 * @param mixed  $transient
+	 * @param string $basename Our key in the transient.
+	 * @param string $installed Version from the file on disk.
+	 */
+	private function purge_installed_entry( $transient, string $basename, string $installed ): void {
+		if ( ! isset( $transient->response[ $basename ] ) || ! is_object( $transient->response[ $basename ] ) ) {
+			return;
+		}
+
+		$entry   = $transient->response[ $basename ];
+		$offered = isset( $entry->new_version ) ? trim( (string) $entry->new_version ) : '';
+
+		if ( $offered === '' || version_compare( $offered, $installed, '<=' ) ) {
+			unset( $transient->response[ $basename ] );
+			return;
+		}
+
+		// Not newer than the constant either — the same phantom, seen from
+		// the other side.
+		if ( version_compare( $offered, CUSTOM_STICKY_VERSION, '<=' ) ) {
+			unset( $transient->response[ $basename ] );
+		}
+	}
+
+	/**
 	 * Drops update entries that point at our main file under a foreign key.
 	 *
-	 * Such entries are leftovers of a hard-coded basename or of a folder that
-	 * was renamed. They make the admin badge count an update that
-	 * get_plugin_updates() cannot list, because the key does not match any
-	 * installed plugin file.
+	 * Such entries are leftovers of the hard-coded basename this class used
+	 * before, or of a folder that was renamed. They make the admin badge
+	 * count an update that get_plugin_updates() cannot list, because the
+	 * key does not match any installed plugin file.
 	 *
 	 * @param mixed  $transient
 	 * @param string $basename Our real basename, kept as is.
@@ -176,7 +259,7 @@ final class CSP_GitHub_Updater {
 	private function purge_stale_entries( $transient, string $basename ): void {
 		$main = wp_basename( CUSTOM_STICKY_PLUGIN_FILE );
 
-		foreach ( array( 'response', 'no_update' ) as $bucket ) {
+		foreach ( [ 'response', 'no_update' ] as $bucket ) {
 			if ( ! isset( $transient->$bucket ) || ! is_array( $transient->$bucket ) ) {
 				continue;
 			}
@@ -195,98 +278,44 @@ final class CSP_GitHub_Updater {
 	}
 
 	/**
-	 * Version of the plugin that is actually on disk.
-	 *
-	 * CUSTOM_STICKY_VERSION is defined when the main file loads: inside the
-	 * request that installs an update it still holds the previous version
-	 * while the files already contain the new one. The header is the source of
-	 * truth; the constant is only a fallback for an unreadable file.
-	 *
-	 * Not cached on purpose: the value has to be re-read after the upgrader
-	 * replaces the files, and a per-request cache would keep the stale one.
-	 */
-	private function installed_version(): string {
-		$data = function_exists( 'get_file_data' )
-			? get_file_data( CUSTOM_STICKY_PLUGIN_FILE, array( 'Version' => 'Version' ), 'plugin' )
-			: array();
-
-		$version = isset( $data['Version'] ) ? trim( (string) $data['Version'] ) : '';
-
-		return '' === $version ? CUSTOM_STICKY_VERSION : $version;
-	}
-
-	/**
-	 * Drops our own response entry when it offers an already installed version.
-	 *
-	 * Core rewrites the update_plugins transient in the request that replaces
-	 * the files. An entry built there from the in-memory constant advertises
-	 * the version that has just been installed, so the site offers the same
-	 * update a second time; it would stay for up to twelve hours.
-	 *
-	 * @param mixed  $transient
-	 * @param string $basename  Our key in the transient.
-	 * @param string $installed Version from the plugin header on disk.
-	 */
-	private function purge_installed_entry( $transient, string $basename, string $installed ): void {
-		if ( ! isset( $transient->response[ $basename ] ) || ! is_object( $transient->response[ $basename ] ) ) {
-			return;
-		}
-
-		$entry   = $transient->response[ $basename ];
-		$offered = isset( $entry->new_version ) ? trim( (string) $entry->new_version ) : '';
-
-		if ( '' !== $offered && version_compare( $offered, $installed, '>' ) ) {
-			// Not newer than the constant either — the same phantom, seen from
-			// the other side.
-			if ( version_compare( $offered, CUSTOM_STICKY_VERSION, '>' ) ) {
-				return;
-			}
-		}
-
-		// Not moved to no_update: a response-shaped entry carries a package
-		// URL, and core builds no_update itself.
-		unset( $transient->response[ $basename ] );
-	}
-
-	/**
 	 * Data for the View plugin details modal.
 	 *
-	 * @param mixed  $result
+	 * @param mixed $result
 	 * @param string $action
-	 * @param mixed  $args
+	 * @param mixed $args
 	 * @return mixed
 	 */
 	public function plugin_info( $result, $action, $args ) {
 		if ( 'plugin_information' !== $action || ! is_object( $args ) || empty( $args->slug ) ) {
 			return $result;
 		}
-		if ( self::dirname() !== (string) $args->slug ) {
+		if ( 'custom-sticky-post' !== (string) $args->slug ) {
 			return $result;
 		}
 
 		$release = $this->get_release();
-		if ( null === $release ) {
+		if ( $release === null ) {
 			return $result;
 		}
 
 		$header = $this->header_data();
 
-		return (object) array(
+		return (object) [
 			'name'          => 'Custom Sticky Post',
-			'slug'          => self::dirname(),
+			'slug'          => 'custom-sticky-post',
 			'version'       => $release['version'],
-			'author'        => '<a href="https://github.com/Gnoztis">Gnostis</a>',
-			'homepage'      => 'https://github.com/' . self::REPO,
+			'author'        => '<a href="https://github.com/Gnoztis">Gnoztis</a>',
+			'homepage'      => 'https://github.com/' . 'Gnoztis/custom-sticky-post',
 			'requires'      => $header['requires'],
 			'tested'        => $this->tested_version( $header['tested'] ),
 			'requires_php'  => $header['requires_php'],
 			'download_link' => $release['package'],
 			'last_updated'  => $release['published_at'],
-			'sections'      => array(
-				'description' => __( 'Один закреплённый пост в начале главной страницы: флажок в метабоксе записи, отдельное оформление и скрытая миниатюра. Управление доступно только администраторам.', 'custom-sticky-post' ),
-				'changelog'   => '' !== $release['body'] ? wpautop( $release['body'] ) : __( 'Описание изменений в релизе не заполнено.', 'custom-sticky-post' ),
-			),
-		);
+			'sections'      => [
+				'description' => __( 'Закрепление одного поста (только для админов). Совместим с PHP 8.4+ и WordPress 7.0+.', 'custom-sticky-post' ),
+				'changelog'   => $release['body'] !== '' ? wpautop( $release['body'] ) : __( 'Описание изменений в релизе не заполнено.', 'custom-sticky-post' ),
+			],
+		];
 	}
 
 	/**
@@ -301,14 +330,32 @@ final class CSP_GitHub_Updater {
 	 * @param array  $hook_extra
 	 * @return string
 	 */
-	public function rename_source( $source, $remote_source, $upgrader, $hook_extra = array() ) {
+	public function rename_source( $source, $remote_source, $upgrader, $hook_extra = [] ) {
 		if ( ! is_string( $source ) || ! is_string( $remote_source ) ) {
 			return $source;
 		}
-		if ( ! is_array( $hook_extra ) || empty( $hook_extra['plugin'] ) ) {
+		if ( ! is_array( $hook_extra ) ) {
 			return $source;
 		}
-		if ( self::basename() !== (string) $hook_extra['plugin'] ) {
+
+		// A single update carries `plugin`, a bulk update carries `plugins`.
+		// Checking only the first form left bulk installs with the folder name
+		// taken from the archive, which produces a second copy of the plugin.
+		$ours   = self::basename();
+		$target = '';
+
+		if ( ! empty( $hook_extra['plugin'] ) ) {
+			$target = (string) $hook_extra['plugin'];
+		} elseif ( ! empty( $hook_extra['plugins'] ) && is_array( $hook_extra['plugins'] ) ) {
+			foreach ( $hook_extra['plugins'] as $candidate ) {
+				if ( $ours === (string) $candidate ) {
+					$target = $ours;
+					break;
+				}
+			}
+		}
+
+		if ( '' === $target || $ours !== $target ) {
 			return $source;
 		}
 		if ( ! is_dir( $source ) ) {
@@ -318,13 +365,14 @@ final class CSP_GitHub_Updater {
 			return $source;
 		}
 
-		// Rename the unpacked directory to the folder the site actually uses,
-		// not to the slug: the update has to replace the installed directory,
-		// otherwise WordPress ends up with two copies of the plugin.
+		// Rename the unpacked directory to the folder the site actually
+		// uses, not to the slug: the update has to replace the installed
+		// directory, otherwise WordPress ends up with two copies of the
+		// plugin (one of them inactive).
 		$folder = dirname( self::basename() );
-		if ( '.' === $folder || '' === $folder ) {
-			// The main file sits directly in the plugins directory, so there
-			// is no directory to rename.
+		if ( $folder === '.' || $folder === '' ) {
+			// The main file sits directly in the plugins directory, so
+			// there is no directory to rename.
 			return $source;
 		}
 
@@ -350,28 +398,92 @@ final class CSP_GitHub_Updater {
 	}
 
 	/**
-	 * Reset the update-check cache after an upgrade so the site does not keep
-	 * advertising the version it has just installed.
-	 *
-	 * @param mixed $upgrader
-	 * @param array $hook_extra
+	 * Reset the update-check cache after an upgrade so we do not keep
+	 * advertising an update for the version just installed.
 	 */
-	public function after_upgrade( $upgrader = null, $hook_extra = array() ): void {
-		$hook_extra = is_array( $hook_extra ) ? $hook_extra : array();
+	public function after_upgrade( $upgrader = null, $hook_extra = [] ): void {
+		if ( is_array( $hook_extra ) ) {
+			$ours = self::basename();
+			$hit  = false;
 
-		if ( ! empty( $hook_extra['plugins'] ) && is_array( $hook_extra['plugins'] ) ) {
-			if ( ! in_array( self::basename(), $hook_extra['plugins'], true ) ) {
+			if ( ! empty( $hook_extra['plugin'] ) ) {
+				$hit = $ours === (string) $hook_extra['plugin'];
+			} elseif ( ! empty( $hook_extra['plugins'] ) && is_array( $hook_extra['plugins'] ) ) {
+				$hit = in_array( $ours, $hook_extra['plugins'], true );
+			}
+
+			// Another plugin was updated: leave our cached release and backoff
+			// alone, otherwise every unrelated update costs a GitHub request.
+			if ( ! $hit ) {
 				return;
 			}
-		} elseif ( ! empty( $hook_extra['plugin'] ) && self::basename() !== (string) $hook_extra['plugin'] ) {
-			return;
 		}
 
-		// The files and their headers have just been replaced: forget the
-		// parsed header values and the cached release check, so the next run
-		// does not advertise the version that is now installed.
-		self::$header = null;
 		$this->flush();
+	}
+
+	/**
+	 * Update state for the /me diagnostics.
+	 *
+	 * Answers "why does the admin show an update badge with nothing to
+	 * update?" in one request: the real basename, and the entry the
+	 * update_plugins transient holds for our main file — including the key
+	 * it sits under, which is where a mismatch shows up.
+	 *
+	 * @return array{plugin_basename:string,transient_entry:bool,transient_key:string,new_version:string,package:string,last_error:array{code:int,reason:string,at:int}|null,next_retry_in:int,token_configured:bool}
+	 */
+	public static function diagnostic(): array {
+		$basename = self::basename();
+
+		$out = [
+			'plugin_basename'  => $basename,
+			'transient_entry'  => false,
+			'transient_key'    => '',
+			'new_version'      => '',
+			'package'          => '',
+			'last_error'       => self::saved_error(),
+			'next_retry_in'    => self::retry_in(),
+			'token_configured' => '' !== self::token(),
+		];
+
+		$transient = get_site_transient( 'update_plugins' );
+		if ( ! is_object( $transient ) || ! isset( $transient->response ) || ! is_array( $transient->response ) ) {
+			return $out;
+		}
+
+		$entry = null;
+		$key   = '';
+
+		if ( isset( $transient->response[ $basename ] ) && is_object( $transient->response[ $basename ] ) ) {
+			$entry = $transient->response[ $basename ];
+			$key   = $basename;
+		} else {
+			// No entry under our key: report a dangling one, if any, so the
+			// badge/list mismatch is visible directly.
+			$main = wp_basename( CUSTOM_STICKY_PLUGIN_FILE );
+			foreach ( $transient->response as $candidate_key => $candidate ) {
+				if ( ! is_object( $candidate ) || empty( $candidate->plugin ) ) {
+					continue;
+				}
+				if ( wp_basename( (string) $candidate->plugin ) !== $main ) {
+					continue;
+				}
+				$entry = $candidate;
+				$key   = (string) $candidate_key;
+				break;
+			}
+		}
+
+		if ( ! is_object( $entry ) ) {
+			return $out;
+		}
+
+		$out['transient_entry'] = true;
+		$out['transient_key']   = $key;
+		$out['new_version']     = isset( $entry->new_version ) ? (string) $entry->new_version : '';
+		$out['package']         = isset( $entry->package ) ? (string) $entry->package : '';
+
+		return $out;
 	}
 
 	/**
@@ -390,17 +502,55 @@ final class CSP_GitHub_Updater {
 			'csp_force_check'
 		);
 
-		$links              = (array) $links;
+		$links = (array) $links;
+
+		// The last check failed: say so, otherwise "no update" and "the check
+		// crashed" look exactly the same in the plugin row.
+		$error = self::saved_error();
+		if ( null !== $error ) {
+			$links['csp_state'] = '<span class="csp-check-failed" style="color:#b32d2e">'
+				. esc_html( self::error_label( $error ) )
+				. '</span>';
+		}
+
 		$links['csp_check'] = '<a href="' . esc_url( $url ) . '">' . esc_html__( 'Проверить обновления', 'custom-sticky-post' ) . '</a>';
 
 		return $links;
 	}
 
 	/**
+	 * Explains a failed check on the Plugins screen.
+	 *
+	 * Without it the failure is invisible: WordPress only shows "no updates",
+	 * and an exhausted GitHub quota looks like a plugin without releases.
+	 */
+	public function admin_notices(): void {
+		if ( ! current_user_can( 'update_plugins' ) ) {
+			return;
+		}
+
+		$screen = function_exists( 'get_current_screen' ) ? get_current_screen() : null;
+		if ( ! $screen || 'plugins' !== $screen->id ) {
+			return;
+		}
+
+		$error = self::saved_error();
+		if ( null === $error ) {
+			return;
+		}
+
+		printf(
+			'<div class="notice notice-warning"><p><strong>%s</strong> %s %s</p></div>',
+			esc_html__( 'Custom Sticky Post: проверка обновлений не удалась.', 'custom-sticky-post' ),
+			esc_html( self::error_label( $error ) . '.' ),
+			esc_html( self::error_hint( $error ) )
+		);
+	}
+
+	/**
 	 * Handles the Check for updates click on plugins.php.
 	 */
 	public function maybe_force_check(): void {
-		// phpcs:ignore WordPress.Security.NonceVerification.Recommended -- nonce is verified below.
 		if ( ! isset( $_GET['csp-force-check'] ) ) {
 			return;
 		}
@@ -408,6 +558,10 @@ final class CSP_GitHub_Updater {
 			return;
 		}
 		check_admin_referer( 'csp_force_check' );
+
+		// The click is an explicit request for a fresh check: ignore and drop
+		// the error backoff, then flush the caches and ask GitHub again.
+		self::$force = true;
 
 		$this->flush();
 
@@ -423,12 +577,12 @@ final class CSP_GitHub_Updater {
 	/**
 	 * Drops every cached value of this class.
 	 *
-	 * Called after an upgrade, so the next run does not reuse the release data
-	 * (and the header values) read before the files were replaced.
+	 * Called after an upgrade, so the next run does not reuse the release
+	 * data (and the header values) read before the files were replaced.
 	 */
 	private function flush(): void {
-		delete_transient( self::UPDATE_TRANSIENT );
-		delete_transient( self::UPDATE_ERROR_TRANSIENT );
+		delete_transient( self::TRANSIENT );
+		delete_transient( self::ERROR_TRANSIENT );
 		delete_site_transient( 'update_plugins' );
 
 		self::$header = null;
@@ -440,74 +594,82 @@ final class CSP_GitHub_Updater {
 
 	/**
 	 * Latest version data (6 hour cache, 15 minute error cache).
-	 *
-	 * @return array<string,mixed>|null
 	 */
 	private function get_release(): ?array {
-		$cached = get_transient( self::UPDATE_TRANSIENT );
+		$cached = get_transient( self::TRANSIENT );
 		if ( is_array( $cached ) && isset( $cached['version'], $cached['package'] ) ) {
 			return $cached;
 		}
 
-		if ( get_transient( self::UPDATE_ERROR_TRANSIENT ) ) {
+		// An explicit force-check is not answered from the backoff: the user
+		// asked for a request, and a cached failure must not fake an answer.
+		if ( ! self::$force && null !== self::saved_error() ) {
 			return null;
 		}
 
-		$release = $this->fetch_latest();
+		$this->last_error = null;
+		$release          = $this->fetch_release();
 
-		if ( null === $release ) {
-			set_transient( self::UPDATE_ERROR_TRANSIENT, 1, self::ERROR_TTL );
+		if ( $release === null ) {
+			$error = $this->last_error ?? [
+				'code'   => 404,
+				'reason' => 'not_found',
+				'at'     => time(),
+			];
+
+			set_transient( self::ERROR_TRANSIENT, $error, 900 );
+
 			return null;
 		}
 
-		set_transient( self::UPDATE_TRANSIENT, $release, self::CACHE_TTL );
+		// A success clears the backoff: the next scheduled check may run again.
+		delete_transient( self::ERROR_TRANSIENT );
+		set_transient( self::TRANSIENT, $release, 21600 );
 
 		return $release;
 	}
 
 	/**
-	 * Picks the higher of the two sources.
+	 * Latest version data: the highest version of both sources.
 	 *
-	 * Both requests are always made: a repository can keep an older release
-	 * while a newer tag already exists, and "release first, otherwise tag"
-	 * would never offer that tag. On equal versions the release wins, because
-	 * it carries the release notes.
+	 * Both sources are always queried (the winner is cached as a whole).
+	 * Taking the release and using the tag only when there is no release
+	 * hides a fresh tag behind an older GitHub Release: the repository
+	 * keeps release 1.6.3, the owner pushes tag 1.7.0, and the update is
+	 * never offered until a release is created by hand.
 	 *
-	 * @return array<string,mixed>|null
+	 * Equal versions: the release wins, it carries the changelog.
 	 */
-	private function fetch_latest(): ?array {
+	private function fetch_release(): ?array {
 		$release = $this->fetch_latest_release();
 		$tag     = $this->fetch_latest_tag();
 
-		if ( null === $release ) {
+		if ( $release === null && $tag === null ) {
+			return null;
+		}
+		if ( $release === null ) {
 			return $tag;
 		}
-		if ( null === $tag ) {
+		if ( $tag === null ) {
 			return $release;
 		}
 
 		return version_compare( $tag['version'], $release['version'], '>' ) ? $tag : $release;
 	}
 
-	/**
-	 * Candidate from the latest GitHub release, with the package of that
-	 * release.
-	 *
-	 * @return array<string,mixed>|null
-	 */
 	private function fetch_latest_release(): ?array {
-		$body = $this->api_get( sprintf( 'https://api.github.com/repos/%s/releases/latest', self::REPO ) );
-		if ( null === $body ) {
+		$body = $this->api_get( sprintf( 'https://api.github.com/repos/%s/releases/latest', 'Gnoztis/custom-sticky-post' ) );
+		if ( $body === null ) {
 			return null;
 		}
 
 		$version = $this->normalize_version( isset( $body['tag_name'] ) ? (string) $body['tag_name'] : '' );
-		if ( '' === $version ) {
+		if ( $version === '' ) {
 			return null;
 		}
 
 		$package = $this->find_package( $body );
-		if ( '' === $package ) {
+		if ( $package === '' ) {
 			return null;
 		}
 
@@ -520,12 +682,14 @@ final class CSP_GitHub_Updater {
 	}
 
 	/**
-	 * Candidate from the tag list: the highest semver tag and its zipball.
-	 *
-	 * @return array<string,mixed>|null
+	 * Highest semver tag of the repository. Competes with the release in
+	 * fetch_release(); a tag without a GitHub Release is a normal case.
 	 */
 	private function fetch_latest_tag(): ?array {
-		$tags = $this->api_get( sprintf( 'https://api.github.com/repos/%s/tags?per_page=30', self::REPO ) );
+		$tags = $this->api_get(
+			sprintf( 'https://api.github.com/repos/%s/tags?per_page=30', 'Gnoztis/custom-sticky-post' )
+		);
+
 		if ( ! is_array( $tags ) ) {
 			return null;
 		}
@@ -538,28 +702,28 @@ final class CSP_GitHub_Updater {
 				continue;
 			}
 			$version = $this->normalize_version( (string) $tag['name'] );
-			if ( '' === $version ) {
+			if ( $version === '' ) {
 				continue;
 			}
-			if ( '' === $best_version || version_compare( $version, $best_version, '>' ) ) {
+			if ( $best_version === '' || version_compare( $version, $best_version, '>' ) ) {
 				$best_version = $version;
 				$best_tag     = (string) $tag['name'];
 			}
 		}
 
-		if ( '' === $best_version || '' === $best_tag ) {
+		if ( $best_version === '' || $best_tag === '' ) {
 			return null;
 		}
 
 		$package = $this->safe_package_url(
 			sprintf(
 				'https://api.github.com/repos/%s/zipball/%s',
-				self::REPO,
+				'Gnoztis/custom-sticky-post',
 				rawurlencode( $best_tag )
 			)
 		);
 
-		if ( '' === $package ) {
+		if ( $package === '' ) {
 			return null;
 		}
 
@@ -567,18 +731,15 @@ final class CSP_GitHub_Updater {
 	}
 
 	/**
-	 * Normalises a GitHub answer into the shape the update pipeline expects.
-	 *
 	 * @param string $version
 	 * @param string $package
 	 * @param string $body
 	 * @param string $published_at
-	 * @return array<string,mixed>
 	 */
 	private function build_release( string $version, string $package, string $body, string $published_at ): array {
 		$header = $this->header_data();
 
-		return array(
+		return [
 			'version'      => $version,
 			'package'      => $package,
 			'body'         => $body,
@@ -586,22 +747,22 @@ final class CSP_GitHub_Updater {
 			'tested'       => $this->tested_version( $header['tested'] ),
 			'requires'     => $header['requires'],
 			'requires_php' => $header['requires_php'],
-		);
+		];
 	}
 
 	/**
 	 * "Tested up to" turned into the value WordPress compares with.
 	 *
-	 * The header holds a branch claim ("7.1"), while the update screen compares
-	 * the stored value with the full running version ("7.1.5"):
-	 * `version_compare( $update->tested, $cur_wp_version, '>=' )`. A branch
-	 * claim is always lower than a patch release, which is why a bare "7.1"
-	 * still renders "Compatibility with WordPress 7.1.5: Not tested".
+	 * The header holds a branch claim ("7.1"), while the update screen
+	 * compares the stored value with the full running version ("7.1.5"):
+	 * version_compare( $update->tested, $cur_wp_version, '>=' ). A branch
+	 * claim is always lower than a patch release, so a bare "7.1" still
+	 * renders "Compatibility with WordPress 7.1.5: Not tested".
 	 *
 	 * api.wordpress.org resolves this by serving the patch release of the
 	 * declared branch: readmes say "Tested up to: 7.1" and the API answers
-	 * "7.1.5". The same expansion is done here, so the claim covers the running
-	 * patch release of the branch the author declared.
+	 * "7.1.5". The same expansion is done here, so the claim covers the
+	 * running patch release of the branch the author declared.
 	 *
 	 * @param string $tested Header value, e.g. "7.1"; empty when absent.
 	 * @return string Empty when the header is absent, otherwise a version.
@@ -640,43 +801,201 @@ final class CSP_GitHub_Updater {
 	/**
 	 * GET to the GitHub API with our User-Agent and an optional token.
 	 *
+	 * Failures are recorded in $last_error instead of being flattened to null:
+	 * a 403 rate limit, a 404 tag and a dead network need different advice.
+	 * A 404 is deliberately not recorded — for releases/latest "no release"
+	 * is a normal answer and the tag list may still provide the update.
+	 *
 	 * @return array<string,mixed>|null
 	 */
 	private function api_get( string $url ): ?array {
-		$args = array(
+		// The token is attached only to GitHub hosts: the URL comes from the
+		// repository constant, never from user input.
+		$host  = strtolower( (string) wp_parse_url( $url, PHP_URL_HOST ) );
+		$args  = [
 			'timeout'     => 5,
 			'redirection' => 2,
-			'headers'     => array(
+			'headers'     => [
 				'Accept'       => 'application/vnd.github+json',
-				'User-Agent'   => self::SLUG . '/' . CUSTOM_STICKY_VERSION,
+				'User-Agent'   => 'Custom-Sticky-Post/' . CUSTOM_STICKY_VERSION,
 				'Content-Type' => 'application/json',
-			),
-		);
+			],
+		];
 
-		$token = $this->token();
-		if ( '' !== $token ) {
+		$token = self::token();
+		if ( '' !== $token && ( 'api.github.com' === $host || 'github.com' === $host ) ) {
 			$args['headers']['Authorization'] = 'Bearer ' . $token;
 		}
 
-		// The URL is built from the repository constant, not from user input;
-		// scheme and host of the answer are validated separately.
-		$response = wp_remote_get( $url, $args ); // phpcs:ignore -- URL built from a constant.
+		// The URL is built from the repository constant, not from user
+		// input; scheme and host of the answer are validated separately.
+		$response = wp_remote_get( $url, $args ); // phpcs:ignore -- URL built from the repository constant; scheme and host are validated below.
+
 		if ( is_wp_error( $response ) ) {
+			$this->last_error = [
+				'code'   => 0,
+				'reason' => 'network',
+				'at'     => time(),
+			];
 			return null;
 		}
-		if ( 200 !== (int) wp_remote_retrieve_response_code( $response ) ) {
+
+		$code = (int) wp_remote_retrieve_response_code( $response );
+
+		if ( 200 !== $code ) {
+			if ( 404 !== $code ) {
+				$this->last_error = [
+					'code'   => $code,
+					'reason' => self::error_reason( $code, $response ),
+					'at'     => time(),
+				];
+			}
 			return null;
 		}
 
 		$body = json_decode( (string) wp_remote_retrieve_body( $response ), true );
 
-		return is_array( $body ) ? $body : null;
+		if ( ! is_array( $body ) ) {
+			$this->last_error = [
+				'code'   => $code,
+				'reason' => 'invalid',
+				'at'     => time(),
+			];
+			return null;
+		}
+
+		return $body;
+	}
+
+	/**
+	 * Why the request failed, in the vocabulary used by the admin notice.
+	 *
+	 * @param int              $code     HTTP status.
+	 * @param array<string,mixed>|WP_Error $response Raw response.
+	 */
+	private static function error_reason( int $code, $response ): string {
+		if ( 429 === $code ) {
+			return 'rate_limit';
+		}
+
+		if ( 403 === $code ) {
+			// GitHub reports an exhausted quota as a 403 with a zero
+			// remaining counter; a plain 403 means the token lacks access.
+			$remaining = '';
+			if ( ! is_wp_error( $response ) ) {
+				$remaining = (string) wp_remote_retrieve_header( $response, 'x-ratelimit-remaining' );
+			}
+
+			return '' === trim( $remaining ) || '0' === trim( $remaining ) ? 'rate_limit' : 'unauthorized';
+		}
+
+		if ( 404 === $code ) {
+			return 'not_found';
+		}
+
+		if ( 401 === $code ) {
+			return 'unauthorized';
+		}
+
+		return 'invalid';
+	}
+
+	/**
+	 * Saved failure of the last check, or null when the last check succeeded.
+	 *
+	 * Before 2.6.2 this transient held a bare `1`, so a rate limit, a missing
+	 * tag and a dead network were indistinguishable. An old-style value may
+	 * still be in the cache right after the upgrade; it is reported as
+	 * "unknown" rather than ignored.
+	 *
+	 * @return array{code:int,reason:string,at:int}|null
+	 */
+	private static function saved_error(): ?array {
+		$error = get_transient( self::ERROR_TRANSIENT );
+
+		if ( is_array( $error ) && isset( $error['reason'] ) ) {
+			return [
+				'code'   => (int) ( $error['code'] ?? 0 ),
+				'reason' => (string) $error['reason'],
+				'at'     => (int) ( $error['at'] ?? 0 ),
+			];
+		}
+
+		if ( $error ) {
+			return [
+				'code'   => 0,
+				'reason' => 'unknown',
+				'at'     => 0,
+			];
+		}
+
+		return null;
+	}
+
+	/**
+	 * Seconds until the failed check may be retried; 0 when there is none.
+	 */
+	private static function retry_in(): int {
+		$error = self::saved_error();
+
+		if ( null === $error || $error['at'] <= 0 ) {
+			return 0;
+		}
+
+		return max( 0, $error['at'] + (int) 900 - time() );
+	}
+
+	/**
+	 * Human readable form of a failure, e.g. "проверка не удалась: 403
+	 * (лимит GitHub API)".
+	 *
+	 * @param array{code:int,reason:string,at:int} $error
+	 */
+	private static function error_label( array $error ): string {
+		$reasons = [
+			'rate_limit'   => __( 'лимит GitHub API', 'custom-sticky-post' ),
+			'not_found'    => __( 'репозиторий или тег не найдены', 'custom-sticky-post' ),
+			'unauthorized' => __( 'токен отклонён', 'custom-sticky-post' ),
+			'network'      => __( 'нет связи с GitHub', 'custom-sticky-post' ),
+			'invalid'      => __( 'неожиданный ответ GitHub', 'custom-sticky-post' ),
+			'unknown'      => __( 'неизвестная ошибка', 'custom-sticky-post' ),
+		];
+
+		$reason = $reasons[ $error['reason'] ] ?? $reasons['unknown'];
+		$code   = $error['code'] > 0 ? (string) $error['code'] : '—';
+
+		return sprintf(
+			/* translators: 1: HTTP status or a dash, 2: failure reason */
+			__( 'проверка не удалась: %1$s (%2$s)', 'custom-sticky-post' ),
+			$code,
+			$reason
+		);
+	}
+
+	/**
+	 * What to do about a failure.
+	 *
+	 * @param array{code:int,reason:string,at:int} $error
+	 */
+	private static function error_hint( array $error ): string {
+		switch ( $error['reason'] ) {
+			case 'rate_limit':
+				return __( 'Задайте CSP_GITHUB_TOKEN в wp-config.php: без токена GitHub разрешает 60 запросов в час на IP, с токеном — 5000.', 'custom-sticky-post' );
+			case 'not_found':
+				return __( 'Проверьте, что тег вида vX.Y.Z существует в репозитории и репозиторий доступен без авторизации.', 'custom-sticky-post' );
+			case 'unauthorized':
+				return __( 'Проверьте CSP_GITHUB_TOKEN: токен должен иметь доступ на чтение публичного репозитория.', 'custom-sticky-post' );
+			case 'network':
+				return __( 'Хостинг не смог открыть api.github.com: проверьте исходящие запросы и DNS.', 'custom-sticky-post' );
+			default:
+				return __( 'Повторите проверку позже; если ошибка повторяется, посмотрите ответ api.github.com.', 'custom-sticky-post' );
+		}
 	}
 
 	/**
 	 * Archive URL: the release zip asset first, then the GitHub zipball.
 	 *
-	 * @param array<string,mixed> $body
+	 * @param array $body
 	 */
 	private function find_package( array $body ): string {
 		if ( ! empty( $body['assets'] ) && is_array( $body['assets'] ) ) {
@@ -689,7 +1008,7 @@ final class CSP_GitHub_Updater {
 					continue;
 				}
 				$url = $this->safe_package_url( (string) $asset['browser_download_url'] );
-				if ( '' !== $url ) {
+				if ( $url !== '' ) {
 					return $url;
 				}
 			}
@@ -703,12 +1022,12 @@ final class CSP_GitHub_Updater {
 	}
 
 	/**
-	 * HTTPS only and GitHub hosts only — the package must not come from a
-	 * field a third-party service could tamper with.
+	 * HTTPS only and GitHub hosts only — the package must not come
+	 * from a field a third-party service could tamper with.
 	 */
 	private function safe_package_url( string $url ): string {
 		$url = esc_url_raw( trim( $url ) );
-		if ( '' === $url ) {
+		if ( $url === '' ) {
 			return '';
 		}
 
@@ -719,7 +1038,7 @@ final class CSP_GitHub_Updater {
 			return '';
 		}
 
-		$allowed = array( 'api.github.com', 'github.com', 'codeload.github.com', 'objects.githubusercontent.com' );
+		$allowed = [ 'api.github.com', 'github.com', 'codeload.github.com', 'objects.githubusercontent.com' ];
 		if ( ! in_array( strtolower( (string) $host ), $allowed, true ) ) {
 			return '';
 		}
@@ -727,10 +1046,6 @@ final class CSP_GitHub_Updater {
 		return $url;
 	}
 
-	/**
-	 * Strict semver: v1.2, 1.2.3 and v1.2.3 are accepted; pre-releases and
-	 * four-part versions are rejected.
-	 */
 	private function normalize_version( string $tag ): string {
 		$tag = trim( $tag );
 		if ( ! preg_match( '/^v?(\d+\.\d+(?:\.\d+)?)$/', $tag, $m ) ) {
@@ -740,44 +1055,49 @@ final class CSP_GitHub_Updater {
 	}
 
 	/**
-	 * GitHub token from wp-config.php or a filter, for API rate limits.
+	 * Personal access token for the GitHub API, if the site provides one.
+	 *
+	 * Optional: a public repository needs no token, but the anonymous quota is
+	 * 60 requests per hour per IP, and several plugins behind one hosting IP
+	 * exhaust it. The value is never printed — diagnostic() only reports
+	 * whether it is configured.
 	 */
-	private function token(): string {
+	private static function token(): string {
 		$token = defined( 'CSP_GITHUB_TOKEN' ) ? (string) CSP_GITHUB_TOKEN : '';
 		$token = (string) apply_filters( 'csp_github_token', $token );
-
 		return trim( $token );
 	}
 
 	/**
-	 * Requires / Requires PHP / Tested up to from the plugin header.
+	 * Version headers of the plugin file.
 	 *
-	 * "Tested up to" is a separate field: WordPress compares it with its own
-	 * version on the update screen, while "Requires at least" is the minimum
-	 * supported version. An absent header yields an empty string, never a copy
-	 * of another field.
+	 * `Tested up to` and `Requires at least` are different things: the
+	 * first is the newest WordPress the plugin was checked against, the
+	 * second is the oldest it runs on. Feeding the minimum into `tested`
+	 * makes the update screen show "compatibility: unknown", so they are
+	 * read separately and `tested` stays empty when the header is absent.
 	 *
 	 * @return array{requires:string,requires_php:string,tested:string}
 	 */
 	private function header_data(): array {
-		if ( null === self::$header ) {
+		if ( self::$header === null ) {
 			$data = function_exists( 'get_file_data' )
 				? get_file_data(
 					CUSTOM_STICKY_PLUGIN_FILE,
-					array(
+					[
 						'Requires at least' => 'Requires at least',
 						'Requires PHP'      => 'Requires PHP',
 						'Tested up to'      => 'Tested up to',
-					),
+					],
 					'plugin'
 				)
-				: array();
+				: [];
 
-			self::$header = array(
+			self::$header = [
 				'requires'     => isset( $data['Requires at least'] ) ? (string) $data['Requires at least'] : '',
 				'requires_php' => isset( $data['Requires PHP'] ) ? (string) $data['Requires PHP'] : '',
 				'tested'       => isset( $data['Tested up to'] ) ? (string) $data['Tested up to'] : '',
-			);
+			];
 		}
 
 		return self::$header;

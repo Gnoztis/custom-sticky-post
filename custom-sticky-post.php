@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Custom Sticky Post
  * Description: Закрепление одного поста (только для админов). Совместим с PHP 8.4+ и WordPress 7.0+.
- * Version:     3.5.2
+ * Version:     3.5.3
  * Author:      Gnostis
  * Author URI:  https://github.com/Gnoztis
  * License:     GPL-2.0-or-later
@@ -24,7 +24,7 @@ if ( ! defined( 'ABSPATH' ) ) {
  * Plugin constants. The version is declared once here and repeated only in the
  * plugin header above; both must match the release tag.
  */
-define( 'CUSTOM_STICKY_VERSION', '3.5.2' );
+define( 'CUSTOM_STICKY_VERSION', '3.5.3' );
 define( 'CUSTOM_STICKY_PLUGIN_FILE', __FILE__ );
 define( 'CUSTOM_STICKY_PLUGIN_DIR', plugin_dir_path( __FILE__ ) );
 

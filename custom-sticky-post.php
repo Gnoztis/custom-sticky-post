@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Custom Sticky Post
  * Description: Закрепление одного поста (только для админов). Совместим с PHP 8.4+ и WordPress 7.0+.
- * Version:     3.5.0
+ * Version:     3.5.1
  * Author:      Gnostis
  * Author URI:  https://github.com/Gnoztis
  * License:     GPL-2.0-or-later
@@ -24,7 +24,7 @@ if ( ! defined( 'ABSPATH' ) ) {
  * Plugin constants. The version is declared once here and repeated only in the
  * plugin header above; both must match the release tag.
  */
-define( 'CUSTOM_STICKY_VERSION', '3.5.0' );
+define( 'CUSTOM_STICKY_VERSION', '3.5.1' );
 define( 'CUSTOM_STICKY_PLUGIN_FILE', __FILE__ );
 define( 'CUSTOM_STICKY_PLUGIN_DIR', plugin_dir_path( __FILE__ ) );
 
@@ -283,24 +283,23 @@ function custom_sticky_hide_thumbnail_on_home( $html, $post_id, $post_thumbnail_
 }
 
 /**
- * 6. Moves the sticky post to the top of the blog home loop.
+ * 6. Keeps the sticky post out of the blog home query.
  *
- * Only the first page is reordered. loop_start runs on every page of the
- * archive, and prepending on page 2 would show the same post twice; the total
- * count (found_posts) is intentionally not touched, so the pagination links
- * stay correct.
+ * The post is rendered separately at the top of the first page. Without this
+ * exclusion the query also returns it in its natural position: a post old
+ * enough to belong to page 2 then appears twice — once prepended on page 1 and
+ * once where it belongs. Excluding it on every page (not only after the first)
+ * keeps the query result identical on every request, so found_posts and
+ * max_num_pages stay consistent and pagination never links to an empty page.
  *
- * The post is removed from the current results before it is prepended, so a
- * second loop_start on the same query (rewind_posts) does not duplicate it.
+ * Main query only: archives, search, REST and secondary queries keep the sticky
+ * post where WordPress put it.
  *
- * @param WP_Query $query Query whose loop is starting.
+ * @param WP_Query $query Query being prepared.
  */
-add_action( 'loop_start', 'custom_sticky_override_loop_start' );
-function custom_sticky_override_loop_start( $query ) {
-	if ( ! ( $query instanceof WP_Query ) || ! is_home() || ! $query->is_main_query() ) {
-		return;
-	}
-	if ( is_paged() || ! is_array( $query->posts ) ) {
+add_action( 'pre_get_posts', 'custom_sticky_exclude_from_home_query' );
+function custom_sticky_exclude_from_home_query( $query ) {
+	if ( ! ( $query instanceof WP_Query ) || is_admin() || ! $query->is_home() || ! $query->is_main_query() ) {
 		return;
 	}
 
@@ -309,27 +308,75 @@ function custom_sticky_override_loop_start( $query ) {
 		return;
 	}
 
+	// Keep any post__not_in another filter has already set.
+	$excluded   = $query->get( 'post__not_in' );
+	$excluded   = is_array( $excluded ) ? $excluded : array();
+	$excluded[] = $sticky_id;
+
+	$query->set( 'post__not_in', array_values( array_unique( array_map( 'absint', $excluded ) ) ) );
+}
+
+/**
+ * 7. Prepends the sticky post to the first page of the blog home results.
+ *
+ * Runs on the main query results, after the exclusion above. Unlike
+ * loop_start, this filter also runs when the query matched nothing — the case
+ * of a site whose only published post is the sticky one — so the loop starts
+ * and the home page renders that post instead of "nothing found".
+ *
+ * found_posts and max_num_pages are left as the query computed them; only the
+ * single-post case raises them to one, so the pagination metadata matches what
+ * is rendered.
+ *
+ * @param WP_Post[] $posts Query results.
+ * @param WP_Query  $query Query object.
+ * @return WP_Post[]
+ */
+add_filter( 'the_posts', 'custom_sticky_prepend_sticky_post', 10, 2 );
+function custom_sticky_prepend_sticky_post( $posts, $query ) {
+	if ( ! is_array( $posts ) || ! ( $query instanceof WP_Query ) || is_admin()
+		|| ! $query->is_home() || ! $query->is_main_query() || $query->is_paged() ) {
+		return $posts;
+	}
+
+	$sticky_id = (int) get_option( 'custom_sticky_post_id', 0 );
+	if ( $sticky_id <= 0 ) {
+		return $posts;
+	}
+
 	$sticky_post = get_post( $sticky_id );
 	if ( ! ( $sticky_post instanceof WP_Post ) || 'publish' !== $sticky_post->post_status ) {
 		delete_option( 'custom_sticky_post_id' );
-		return;
+		return $posts;
 	}
 
+	// The query already excludes the post; filtering again keeps the callback
+	// idempotent if a later filter reset post__not_in.
 	$remaining = array_values(
 		array_filter(
-			$query->posts,
+			$posts,
 			static function ( $post ) use ( $sticky_id ) {
 				return $post instanceof WP_Post && (int) $post->ID !== $sticky_id;
 			}
 		)
 	);
 
-	$query->posts      = array_merge( array( $sticky_post ), $remaining );
-	$query->post_count = count( $query->posts );
+	$prepended         = array_merge( array( $sticky_post ), $remaining );
+	$query->posts      = $prepended;
+	$query->post_count = count( $prepended );
+
+	if ( (int) $query->found_posts < 1 ) {
+		// Only the sticky post is published: the query matched nothing because
+		// the post was excluded, while the home page renders it.
+		$query->found_posts   = 1;
+		$query->max_num_pages = 1;
+	}
+
+	return $prepended;
 }
 
 /**
- * 7. Adds the custom-sticky-post class to the sticky post.
+ * 8. Adds the custom-sticky-post class to the sticky post.
  *
  * @param string[] $classes Post classes.
  * @param string[] $class   Additional classes.
@@ -349,7 +396,7 @@ function custom_sticky_post_class( $classes, $class, $post_id ) {
 }
 
 /**
- * 8. Prints the sticky post styles on the home page.
+ * 9. Prints the sticky post styles on the home page.
  *
  * The stylesheet is static: no option, post field or request value is
  * interpolated, so there is nothing to escape here. The marker classes are

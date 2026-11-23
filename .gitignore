@@ -12,3 +12,10 @@ Thumbs.db
 # IDE
 .idea/
 .vscode/
+
+# Локальные тесты и харнессы — не коммитятся (правило проекта: тесты не в git)
+tests/
+tests.php
+*.test.mjs
+*.test.js
+*-test.php

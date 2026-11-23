@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Custom Sticky Post
  * Description: Закрепление одного поста (только для админов). Совместим с PHP 8.4+ и WordPress 7.0+.
- * Version:     3.5.7
+ * Version:     3.5.8
  * Author:      Gnostis
  * Author URI:  https://github.com/Gnoztis
  * License:     GPL-2.0-or-later
@@ -24,7 +24,7 @@ if ( ! defined( 'ABSPATH' ) ) {
  * Plugin constants. The version is declared once here and repeated only in the
  * plugin header above; both must match the release tag.
  */
-define( 'CUSTOM_STICKY_VERSION', '3.5.7' );
+define( 'CUSTOM_STICKY_VERSION', '3.5.8' );
 define( 'CUSTOM_STICKY_PLUGIN_FILE', __FILE__ );
 define( 'CUSTOM_STICKY_PLUGIN_DIR', plugin_dir_path( __FILE__ ) );
 
@@ -376,17 +376,20 @@ function custom_sticky_prepend_sticky_post( $posts, $query ) {
 }
 
 /**
- * 8. Last-Modified of the page that is actually rendered.
+ * 8. Last-Modified of the page that is actually rendered (opt-in).
+ *
+ * Disabled by default since 3.5.8: the front end behaves exactly like 3.5.6,
+ * where WordPress and the theme decide the header and the reverse-proxy cache
+ * is kept fresh by the post_modified bump on publish and on a sticky change.
+ * The computation stays here for sites that enable the header explicitly via
+ * custom_sticky_last_modified_enabled().
  *
  * The sticky post is prepended to $query->posts, so anything that takes the
  * modification time of the first post — a theme, a page cache, a reverse proxy
  * comparing If-Modified-Since — keeps reporting the sticky post's time and
- * never notices a new post. This plugin therefore sets Last-Modified itself,
- * from every post that renders: the query results (the sticky post is already
- * among them on the home page) plus the posts excluded through post__not_in.
- * The sticky post is exactly such an excluded post; including the excluded IDs
- * also covers a filter that hides a post from the SQL query while the site
- * still shows it, so a newly published post cannot leave the header behind.
+ * never notices a new post. When enabled, the header is computed from every
+ * post that renders: the query results (the sticky post is already among them
+ * on the home page) plus the posts excluded through post__not_in.
  *
  * Read-only: nothing is written to the database.
  *
@@ -461,8 +464,32 @@ function custom_sticky_last_modified_timestamp() {
 }
 
 /**
+ * Whether the plugin sends its own Last-Modified header.
+ *
+ * Off by default. Release 3.5.8 returns the front end to the 3.5.6 behaviour:
+ * WordPress and the theme decide the header, and freshness is kept by the
+ * post_modified bump on publish and on a sticky change. Enable the plugin
+ * header explicitly with define( 'CUSTOM_STICKY_LAST_MODIFIED', true ) in
+ * wp-config.php, or by returning true from the custom_sticky_last_modified
+ * filter before the plugin loads (for example from an mu-plugin).
+ *
+ * @return bool
+ */
+function custom_sticky_last_modified_enabled() {
+	$enabled = defined( 'CUSTOM_STICKY_LAST_MODIFIED' ) ? (bool) CUSTOM_STICKY_LAST_MODIFIED : false;
+
+	/**
+	 * Filters whether the plugin sends its own Last-Modified header.
+	 *
+	 * @param bool $enabled Whether the header is enabled. Default false.
+	 */
+	return (bool) apply_filters( 'custom_sticky_last_modified', $enabled );
+}
+
+/**
  * Sends the Last-Modified header, never lowering a newer value already sent.
  *
+ * Only registered when custom_sticky_last_modified_enabled() is true.
  * Hooked on send_headers at a late priority and again late on
  * template_redirect: a theme that computes the value from the first post does
  * it in its own template_redirect callback, which runs after send_headers. The
@@ -470,6 +497,9 @@ function custom_sticky_last_modified_timestamp() {
  * kept, so the header only ever moves forward.
  */
 function custom_sticky_maybe_send_last_modified() {
+	if ( ! custom_sticky_last_modified_enabled() ) {
+		return;
+	}
 	if ( headers_sent() ) {
 		return;
 	}
@@ -495,8 +525,10 @@ function custom_sticky_maybe_send_last_modified() {
 	header( 'Last-Modified: ' . gmdate( 'D, d M Y H:i:s', $latest ) . ' GMT', true ); // phpcs:ignore -- formatted timestamp, not user input.
 }
 
-add_action( 'send_headers', 'custom_sticky_maybe_send_last_modified', 9999 );
-add_action( 'template_redirect', 'custom_sticky_maybe_send_last_modified', 9999 );
+if ( custom_sticky_last_modified_enabled() ) {
+	add_action( 'send_headers', 'custom_sticky_maybe_send_last_modified', 9999 );
+	add_action( 'template_redirect', 'custom_sticky_maybe_send_last_modified', 9999 );
+}
 
 /**
  * 9. Adds the custom-sticky-post class to the sticky post.

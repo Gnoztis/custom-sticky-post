@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Custom Sticky Post
  * Description: Закрепление одного поста (только для админов). Совместим с PHP 8.4+ и WordPress 7.0+.
- * Version:     3.5.3
+ * Version:     3.5.4
  * Author:      Gnostis
  * Author URI:  https://github.com/Gnoztis
  * License:     GPL-2.0-or-later
@@ -10,7 +10,7 @@
  * Text Domain: custom-sticky-post
  * Requires at least: 7.0
  * Tested up to: 7.1
- * Requires PHP: 8.4
+ * Requires PHP: 8.0
  * Update URI:  https://github.com/Gnoztis/custom-sticky-post
  *
  * @package CustomStickyPost
@@ -24,7 +24,7 @@ if ( ! defined( 'ABSPATH' ) ) {
  * Plugin constants. The version is declared once here and repeated only in the
  * plugin header above; both must match the release tag.
  */
-define( 'CUSTOM_STICKY_VERSION', '3.5.3' );
+define( 'CUSTOM_STICKY_VERSION', '3.5.4' );
 define( 'CUSTOM_STICKY_PLUGIN_FILE', __FILE__ );
 define( 'CUSTOM_STICKY_PLUGIN_DIR', plugin_dir_path( __FILE__ ) );
 
@@ -60,7 +60,7 @@ function custom_sticky_check_requirements() {
  * @return bool
  */
 function custom_sticky_requirements_met() {
-	if ( version_compare( PHP_VERSION, '8.4', '<' ) ) {
+	if ( version_compare( PHP_VERSION, '8.0', '<' ) ) {
 		return false;
 	}
 
@@ -73,7 +73,7 @@ function custom_sticky_requirements_met() {
 function custom_sticky_requirements_notice() {
 	printf(
 		'<div class="notice notice-error"><p>%s</p></div>',
-		esc_html__( 'Плагин Custom Sticky Post требует PHP 8.4 или выше и WordPress 7.0 или выше.', 'custom-sticky-post' )
+		esc_html__( 'Плагин Custom Sticky Post требует PHP 8.0 или выше и WordPress 7.0 или выше.', 'custom-sticky-post' )
 	);
 }
 
